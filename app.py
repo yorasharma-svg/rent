@@ -331,8 +331,7 @@ with tab2:
         with c2:
             st.write("📲 **Ready-to-Copy WhatsApp Message:**")
             
-            prev_bal_wa = f"⏳ *Previous Balance (Bakaya):* ₹{t_data['previous_balance']:,.0f}
-" if t_data['previous_balance'] > 0 else ""
+            prev_bal_wa = (f"⏳ *Previous Balance (Bakaya):* ₹{t_data['previous_balance']:,.0f}\n" if t_data['previous_balance'] > 0 else "")
             
             wa_text = f"""*RENT & UTILITY BILL ({selected_month})*
 ----------------------------------
