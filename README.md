@@ -1,8 +1,6 @@
-# Property Rent & Utility Management Web App (v6)
+# Property Rent & Utility Management Web App (v7 - Auto Schema Migration & KeyError Fix)
 
-### Features:
-- **Edit / Delete Existing Tenants:** Modify name, house, rent, rates, mobile no or delete from current/all months.
-- **Multi-Property Management:** Manage multiple houses/properties with sidebar filtering.
-- **1-Click Direct WhatsApp Chat:** Native WhatsApp button opens chat directly with pre-typed bill receipt.
-- **Dynamic Month Rollover:** Infinite month creation with automatic carry-forward of previous meter readings.
-- **Utility Liability Dashboard:** Track Total Rent, Previous Arrears, Electricity Recovery Pool, and Water Collection.
+Deploy to Streamlit Community Cloud:
+1. Upload files (`app.py`, `requirements.txt`, `rent_ledger.db`) to your GitHub repository.
+2. Connect repo to https://share.streamlit.io
+3. Main file path: app.py
