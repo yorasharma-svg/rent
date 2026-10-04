@@ -2,6 +2,9 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 import datetime
+import json
+import os
+import urllib.parse
 
 # Page Configuration for Mobile Responsiveness
 st.set_page_config(
@@ -11,7 +14,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom Styling for Clean Mobile & Desktop Look with Strict Color Visibility
+# Custom Styling for Clean Mobile & Desktop Look
 st.markdown("""
     <style>
     .main-header { font-size: 24px; font-weight: bold; color: #1E3A8A !important; margin-bottom: 10px; }
@@ -31,108 +34,178 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# Database Connection
-DB_FILE = "rent_ledger.db"
+# --- DATABASE ENGINE DETECTOR (SUPABASE / POSTGRES vs LOCAL SQLITE) ---
+def get_db_uri():
+    if "DATABASE_URL" in st.secrets:
+        return st.secrets["DATABASE_URL"]
+    elif "postgres" in st.secrets and "url" in st.secrets["postgres"]:
+        return st.secrets["postgres"]["url"]
+    elif "DATABASE_URL" in os.environ:
+        return os.environ["DATABASE_URL"]
+    return None
 
-def get_db_connection():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
+DB_URI = get_db_uri()
+IS_POSTGRES = DB_URI is not None and DB_URI.startswith(("postgres://", "postgresql://"))
 
-def init_db():
-    conn = get_db_connection()
+if IS_POSTGRES and DB_URI.startswith("postgres://"):
+    # Fix legacy heroku/supabase postgres:// prefix for SQLAlchemy
+    DB_URI = DB_URI.replace("postgres://", "postgresql://", 1)
+
+def get_connection():
+    if IS_POSTGRES:
+        import psycopg2
+        return psycopg2.connect(DB_URI)
+    else:
+        conn = sqlite3.connect("rent_ledger.db")
+        conn.row_factory = sqlite3.Row
+        return conn
+
+def execute_query(query, params=(), fetchall=False, fetchone=False, commit=False):
+    conn = get_connection()
     cursor = conn.cursor()
     
-    # Create Houses Table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS houses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            house_name TEXT UNIQUE NOT NULL
-        )
-    """)
-    
-    # Seed default house if empty
-    cursor.execute("SELECT COUNT(*) FROM houses")
-    if cursor.fetchone()[0] == 0:
-        cursor.execute("INSERT INTO houses (house_name) VALUES ('Main House')")
-    
-    # Create Months Table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS months (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            month_year TEXT UNIQUE NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    # Create Ledger Table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS ledger (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            month_year TEXT NOT NULL,
-            house_name TEXT DEFAULT 'Main House',
-            tenant_name TEXT NOT NULL,
-            mobile_no TEXT DEFAULT '',
-            category TEXT NOT NULL,
-            base_rent REAL DEFAULT 0,
-            previous_balance REAL DEFAULT 0,
-            pr_reading REAL DEFAULT 0,
-            cr_reading REAL,
-            elec_rate REAL DEFAULT 8,
-            water_charge REAL DEFAULT 0,
-            remarks TEXT,
-            FOREIGN KEY (month_year) REFERENCES months (month_year),
-            UNIQUE(month_year, tenant_name)
-        )
-    """)
-    
-    # --- AUTO-MIGRATION / SCHEMA UPGRADES FOR EXISTING DATABASES ---
-    cursor.execute("PRAGMA table_info(ledger)")
-    existing_cols = [row['name'] for row in cursor.fetchall()]
-    
-    if 'house_name' not in existing_cols:
-        try:
-            cursor.execute("ALTER TABLE ledger ADD COLUMN house_name TEXT DEFAULT 'Main House'")
-        except Exception:
-            pass
-            
-    if 'mobile_no' not in existing_cols:
-        try:
-            cursor.execute("ALTER TABLE ledger ADD COLUMN mobile_no TEXT DEFAULT ''")
-        except Exception:
-            pass
-            
-    if 'previous_balance' not in existing_cols:
-        try:
-            cursor.execute("ALTER TABLE ledger ADD COLUMN previous_balance REAL DEFAULT 0")
-        except Exception:
-            pass
-
-    # Seed Initial October 2026 Data if DB is completely empty
-    cursor.execute("SELECT COUNT(*) FROM months")
-    if cursor.fetchone()[0] == 0:
-        cursor.execute("INSERT INTO months (month_year) VALUES ('October 2026')")
+    # Handle %s placeholder for Postgres vs ? placeholder for SQLite
+    if IS_POSTGRES:
+        query = query.replace("?", "%s")
         
+    cursor.execute(query, params)
+    
+    result = None
+    if fetchall:
+        result = cursor.fetchall()
+    elif fetchone:
+        result = cursor.fetchone()
+        
+    if commit:
+        conn.commit()
+        
+    conn.close()
+    return result
+
+def query_to_df(query, params=()):
+    conn = get_connection()
+    if IS_POSTGRES:
+        query = query.replace("?", "%s")
+    df = pd.read_sql_query(query, conn, params=params)
+    conn.close()
+    return df
+
+# Initialize Tables and Schema
+def init_db():
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    if IS_POSTGRES:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS months (
+                id SERIAL PRIMARY KEY,
+                month_year VARCHAR(100) UNIQUE NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS properties (
+                id SERIAL PRIMARY KEY,
+                house_name VARCHAR(150) UNIQUE NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS ledger (
+                id SERIAL PRIMARY KEY,
+                month_year VARCHAR(100) NOT NULL,
+                house_name VARCHAR(150) DEFAULT 'Main House',
+                tenant_name VARCHAR(150) NOT NULL,
+                mobile_no VARCHAR(20) DEFAULT '',
+                category VARCHAR(50) NOT NULL,
+                base_rent REAL DEFAULT 0,
+                previous_balance REAL DEFAULT 0,
+                pr_reading REAL DEFAULT 0,
+                cr_reading REAL,
+                elec_rate REAL DEFAULT 8,
+                water_charge REAL DEFAULT 0,
+                remarks TEXT,
+                UNIQUE(month_year, tenant_name)
+            );
+        """)
+    else:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS months (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                month_year TEXT UNIQUE NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS properties (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                house_name TEXT UNIQUE NOT NULL
+            );
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                month_year TEXT NOT NULL,
+                house_name TEXT DEFAULT 'Main House',
+                tenant_name TEXT NOT NULL,
+                mobile_no TEXT DEFAULT '',
+                category TEXT NOT NULL,
+                base_rent REAL DEFAULT 0,
+                previous_balance REAL DEFAULT 0,
+                pr_reading REAL DEFAULT 0,
+                cr_reading REAL,
+                elec_rate REAL DEFAULT 8,
+                water_charge REAL DEFAULT 0,
+                remarks TEXT,
+                UNIQUE(month_year, tenant_name)
+            );
+        """)
+        # Migrations for SQLite
+        cursor.execute("PRAGMA table_info(ledger)")
+        columns = [col[1] for col in cursor.fetchall()]
+        if 'house_name' not in columns:
+            cursor.execute("ALTER TABLE ledger ADD COLUMN house_name TEXT DEFAULT 'Main House'")
+        if 'mobile_no' not in columns:
+            cursor.execute("ALTER TABLE ledger ADD COLUMN mobile_no TEXT DEFAULT ''")
+        if 'previous_balance' not in columns:
+            cursor.execute("ALTER TABLE ledger ADD COLUMN previous_balance REAL DEFAULT 0")
+
+    conn.commit()
+    
+    # Seed default properties and initial data if empty
+    cursor.execute("SELECT COUNT(*) FROM months")
+    month_count = cursor.fetchone()[0]
+
+    if month_count == 0:
+        if IS_POSTGRES:
+            cursor.execute("INSERT INTO properties (house_name) VALUES ('Main House'), ('Shop Building') ON CONFLICT DO NOTHING;")
+            cursor.execute("INSERT INTO months (month_year) VALUES ('October 2026') ON CONFLICT DO NOTHING;")
+        else:
+            cursor.execute("INSERT OR IGNORE INTO properties (house_name) VALUES ('Main House'), ('Shop Building');")
+            cursor.execute("INSERT OR IGNORE INTO months (month_year) VALUES ('October 2026');")
+
         initial_tenants = [
-            ("Main House", "Gupta Ji", "Shop", 5000, 0, 3396, 3428, 9, 0, "Shop - Rate ₹9/unit; Water N/A", ""),
-            ("Main House", "Ashwini", "Residential", 4000, 0, 6602, 6618, 8, 142, "Residential - Rate ₹8/unit; Water provisional ₹142", ""),
-            ("Main House", "Anoop Sharma", "Residential", 4500, 0, 6363, None, 8, 0, "Residential - Rate ₹8/unit", ""),
-            ("Main House", "Satish Pathak (Sarthak)", "Residential", 2700, 0, 1477, None, 8, 0, "Residential - Rate ₹8/unit", ""),
-            ("Main House", "Umesh Pathak", "Residential", 3750, 0, 6315, None, 8, 0, "Residential - Rate ₹8/unit", ""),
-            ("Main House", "Ramsingh Saini", "Shop", 5000, 0, 10379, None, 9, 0, "Shop - Rate ₹9/unit; Water N/A", ""),
-            ("Main House", "Vinod Sharma", "Residential", 3750, 0, 6276, None, 8, 0, "Residential - Rate ₹8/unit", ""),
-            ("Main House", "Submersible (Pump)", "Common Utility", 0, 0, 6774, None, 8, 0, "Common Utility - Rate ₹8/unit", ""),
-            ("Main House", "Tiwari Ji", "Residential", 3000, 0, 4263, None, 8, 0, "Faulty Meter (मीटर खराब है)", ""),
-            ("Main House", "Neeraj Kumar", "Residential", 3800, 0, 2447, None, 8, 0, "Residential - Rate ₹8/unit", "")
+            ("Shop Building", "Gupta Ji", "", "Shop", 5000, 0, 3396, 3428, 9, 0, "Shop - Rate ₹9/unit; Water N/A"),
+            ("Main House", "Ashwini", "", "Residential", 4000, 0, 6602, 6618, 8, 142, "Residential - Rate ₹8/unit; Water provisional ₹142"),
+            ("Main House", "Anoop Sharma", "", "Residential", 4500, 0, 6363, None, 8, 0, "Residential - Rate ₹8/unit"),
+            ("Main House", "Satish Pathak (Sarthak)", "", "Residential", 2700, 0, 1477, None, 8, 0, "Residential - Rate ₹8/unit"),
+            ("Main House", "Umesh Pathak", "", "Residential", 3750, 0, 6315, None, 8, 0, "Residential - Rate ₹8/unit"),
+            ("Shop Building", "Ramsingh Saini", "", "Shop", 5000, 0, 10379, None, 9, 0, "Shop - Rate ₹9/unit; Water N/A"),
+            ("Main House", "Vinod Sharma", "", "Residential", 3750, 0, 6276, None, 8, 0, "Residential - Rate ₹8/unit"),
+            ("Main House", "Submersible (Pump)", "", "Common Utility", 0, 0, 6774, None, 8, 0, "Common Utility - Rate ₹8/unit"),
+            ("Main House", "Tiwari Ji", "", "Residential", 3000, 0, 4263, None, 8, 0, "Faulty Meter (मीटर खराब है)"),
+            ("Main House", "Neeraj Kumar", "", "Residential", 3800, 0, 2447, None, 8, 0, "Residential - Rate ₹8/unit")
         ]
         
         for t in initial_tenants:
-            cursor.execute("""
-                INSERT INTO ledger (month_year, house_name, tenant_name, category, base_rent, previous_balance, pr_reading, cr_reading, elec_rate, water_charge, remarks, mobile_no)
-                VALUES ('October 2026', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, t)
-            
-    conn.commit()
+            if IS_POSTGRES:
+                cursor.execute("""
+                    INSERT INTO ledger (month_year, house_name, tenant_name, mobile_no, category, base_rent, previous_balance, pr_reading, cr_reading, elec_rate, water_charge, remarks)
+                    VALUES ('October 2026', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT DO NOTHING
+                """, t)
+            else:
+                cursor.execute("""
+                    INSERT OR IGNORE INTO ledger (month_year, house_name, tenant_name, mobile_no, category, base_rent, previous_balance, pr_reading, cr_reading, elec_rate, water_charge, remarks)
+                    VALUES ('October 2026', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, t)
+
+        conn.commit()
     conn.close()
 
 init_db()
@@ -140,16 +213,20 @@ init_db()
 # --- SIDEBAR: NAVIGATION & CONTROLS ---
 st.sidebar.title("🏢 Navigation & Controls")
 
-conn = get_db_connection()
-months_df = pd.read_sql_query("SELECT month_year FROM months ORDER BY id DESC", conn)
-houses_df = pd.read_sql_query("SELECT house_name FROM houses ORDER BY house_name ASC", conn)
-conn.close()
+if IS_POSTGRES:
+    st.sidebar.success("⚡ Connected to Cloud Database (Supabase/Postgres)")
+else:
+    st.sidebar.info("💾 Running on Local Database (SQLite)")
 
-available_months = months_df['month_year'].tolist()
-available_houses = ["All Properties / Houses"] + houses_df['house_name'].tolist()
+months_df = query_to_df("SELECT month_year FROM months ORDER BY id DESC")
+available_months = months_df['month_year'].tolist() if not months_df.empty else ["October 2026"]
 
 selected_month = st.sidebar.selectbox("📅 Select Ledger Month", available_months)
-selected_house_filter = st.sidebar.selectbox("🏠 Filter Property / House", available_houses)
+
+# Property / House Filter
+properties_df = query_to_df("SELECT house_name FROM properties ORDER BY house_name ASC")
+available_properties = ["All Properties"] + (properties_df['house_name'].tolist() if not properties_df.empty else ["Main House", "Shop Building"])
+selected_property = st.sidebar.selectbox("🏠 Filter Property / House", available_properties)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("➕ Create New Month Ledger")
@@ -161,20 +238,30 @@ if st.sidebar.button("🚀 Roll Over & Create Month"):
     elif new_month_input.strip() in available_months:
         st.sidebar.warning("This month already exists!")
     else:
-        conn = get_db_connection()
+        conn = get_connection()
         cursor = conn.cursor()
-        cursor.execute("INSERT INTO months (month_year) VALUES (?)", (new_month_input.strip(),))
-        
-        prev_data = pd.read_sql_query("SELECT * FROM ledger WHERE month_year = ?", conn, params=(selected_month,))
+        if IS_POSTGRES:
+            cursor.execute("INSERT INTO months (month_year) VALUES (%s)", (new_month_input.strip(),))
+        else:
+            cursor.execute("INSERT INTO months (month_year) VALUES (?)", (new_month_input.strip(),))
+            
+        prev_data = query_to_df("SELECT * FROM ledger WHERE month_year = ?", params=(selected_month,))
         
         for _, row in prev_data.iterrows():
-            new_pr = row['cr_reading'] if pd.notnull(row.get('cr_reading')) else row.get('pr_reading', 0)
-            h_name = row.get('house_name', 'Main House')
-            mob_no = row.get('mobile_no', '')
-            cursor.execute("""
-                INSERT INTO ledger (month_year, house_name, tenant_name, mobile_no, category, base_rent, previous_balance, pr_reading, cr_reading, elec_rate, water_charge, remarks)
-                VALUES (?, ?, ?, ?, ?, ?, 0, ?, NULL, ?, ?, ?)
-            """, (new_month_input.strip(), h_name, row['tenant_name'], mob_no, row['category'], row['base_rent'], new_pr, row['elec_rate'], row['water_charge'], row['remarks']))
+            new_pr = row['cr_reading'] if pd.notnull(row['cr_reading']) else row['pr_reading']
+            h_name = row['house_name'] if 'house_name' in row and pd.notnull(row['house_name']) else 'Main House'
+            m_no = row['mobile_no'] if 'mobile_no' in row and pd.notnull(row['mobile_no']) else ''
+            
+            if IS_POSTGRES:
+                cursor.execute("""
+                    INSERT INTO ledger (month_year, house_name, tenant_name, mobile_no, category, base_rent, previous_balance, pr_reading, cr_reading, elec_rate, water_charge, remarks)
+                    VALUES (%s, %s, %s, %s, %s, %s, 0, %s, NULL, %s, %s, %s)
+                """, (new_month_input.strip(), h_name, row['tenant_name'], m_no, row['category'], row['base_rent'], new_pr, row['elec_rate'], row['water_charge'], row['remarks']))
+            else:
+                cursor.execute("""
+                    INSERT INTO ledger (month_year, house_name, tenant_name, mobile_no, category, base_rent, previous_balance, pr_reading, cr_reading, elec_rate, water_charge, remarks)
+                    VALUES (?, ?, ?, ?, ?, ?, 0, ?, NULL, ?, ?, ?)
+                """, (new_month_input.strip(), h_name, row['tenant_name'], m_no, row['category'], row['base_rent'], new_pr, row['elec_rate'], row['water_charge'], row['remarks']))
             
         conn.commit()
         conn.close()
@@ -183,36 +270,19 @@ if st.sidebar.button("🚀 Roll Over & Create Month"):
 
 # --- MAIN APP BODY ---
 st.title("🏢 Property Rent & Utility Management")
-st.caption(f"Currently Viewing: **{selected_month}** | Filter: **{selected_house_filter}**")
+filter_text = f" | Property: **{selected_property}**" if selected_property != "All Properties" else " | **All Properties**"
+st.caption(f"Currently Viewing: **{selected_month}**{filter_text}")
 
 # Load Current Month Ledger
-conn = get_db_connection()
-ledger_df = pd.read_sql_query("SELECT * FROM ledger WHERE month_year = ?", conn, params=(selected_month,))
-conn.close()
+if selected_property == "All Properties":
+    ledger_df = query_to_df("SELECT * FROM ledger WHERE month_year = ?", params=(selected_month,))
+else:
+    ledger_df = query_to_df("SELECT * FROM ledger WHERE month_year = ? AND house_name = ?", params=(selected_month, selected_property))
 
-# DEFENSIVE PANDAS HANDLING TO PREVENT KEYERROR ON OLD DBs
-required_columns_defaults = {
-    'id': None,
-    'house_name': 'Main House',
-    'tenant_name': 'Unknown',
-    'mobile_no': '',
-    'category': 'Residential',
-    'base_rent': 0.0,
-    'previous_balance': 0.0,
-    'pr_reading': 0.0,
-    'cr_reading': None,
-    'elec_rate': 8.0,
-    'water_charge': 0.0,
-    'remarks': ''
-}
-
-for col, def_val in required_columns_defaults.items():
+# Defensive check for missing columns
+for col, default_val in [('house_name', 'Main House'), ('mobile_no', ''), ('previous_balance', 0.0), ('cr_reading', None)]:
     if col not in ledger_df.columns:
-        ledger_df[col] = def_val
-
-# Apply House Filter if needed
-if selected_house_filter != "All Properties / Houses":
-    ledger_df = ledger_df[ledger_df['house_name'] == selected_house_filter].copy()
+        ledger_df[col] = default_val
 
 # Computations
 ledger_df['cr_reading_calc'] = ledger_df['cr_reading'].fillna(ledger_df['pr_reading'])
@@ -226,11 +296,11 @@ st.subheader("📊 Financial Summary & Utility Liability")
 
 m1, m2, m3, m4, m5 = st.columns(5)
 
-total_rent = ledger_df['base_rent'].sum() if len(ledger_df) > 0 else 0
-total_arrears = ledger_df['previous_balance'].sum() if len(ledger_df) > 0 else 0
-total_elec = ledger_df['elec_charge'].sum() if len(ledger_df) > 0 else 0
-total_water = ledger_df['water_charge'].sum() if len(ledger_df) > 0 else 0
-grand_total = ledger_df['total_payable'].sum() if len(ledger_df) > 0 else 0
+total_rent = ledger_df['base_rent'].sum() if not ledger_df.empty else 0
+total_arrears = ledger_df['previous_balance'].sum() if not ledger_df.empty else 0
+total_elec = ledger_df['elec_charge'].sum() if not ledger_df.empty else 0
+total_water = ledger_df['water_charge'].sum() if not ledger_df.empty else 0
+grand_total = ledger_df['total_payable'].sum() if not ledger_df.empty else 0
 
 m1.metric("🏠 Base Rent", f"₹{total_rent:,.0f}")
 m2.metric("⏳ Prev. Arrears", f"₹{total_arrears:,.0f}")
@@ -240,63 +310,74 @@ m5.metric("💰 Grand Total", f"₹{grand_total:,.0f}")
 
 st.markdown("---")
 
-# --- TABS FOR LEDGER AND RECEIPT ---
-tab1, tab2, tab3 = st.tabs(["📝 Monthly Ledger & Meter Entry", "📱 Individual WhatsApp Receipt", "⚙️ Manage Houses & Tenants Profile"])
+# --- TABS ---
+tab1, tab2, tab3, tab4 = st.tabs(["📝 Monthly Ledger & Meter Entry", "📱 Individual WhatsApp Receipt", "⚙️ Manage Houses & Tenants Profile", "💾 Backup & Restore Database"])
 
 with tab1:
     st.subheader(f"Ledger Table - {selected_month}")
-    st.info("💡 Edit Current Readings (C.R.), Mobile No, Previous Arrears, and Water Charges directly in the table below and click 'Save Changes'.")
+    st.info("💡 Edit Current Readings (C.R.), Previous Arrears, Water Charges, and Mobile Numbers directly in the table below and click 'Save Changes'.")
     
-    display_df = ledger_df[['id', 'house_name', 'tenant_name', 'mobile_no', 'category', 'base_rent', 'previous_balance', 'pr_reading', 'cr_reading', 'units_consumed', 'elec_rate', 'elec_charge', 'water_charge', 'total_payable', 'remarks']].copy()
-    
-    edited_df = st.data_editor(
-        display_df,
-        column_config={
-            "id": None,
-            "house_name": st.column_config.TextColumn("Property/House", disabled=True),
-            "tenant_name": st.column_config.TextColumn("Tenant Name", disabled=True),
-            "mobile_no": st.column_config.TextColumn("Mobile No", help="10-digit Mobile Number"),
-            "category": st.column_config.TextColumn("Category", disabled=True),
-            "base_rent": st.column_config.NumberColumn("Base Rent (₹)", disabled=True, format="₹%d"),
-            "previous_balance": st.column_config.NumberColumn("Prev Arrears (₹)", help="Previous unpaid dues", format="₹%d"),
-            "pr_reading": st.column_config.NumberColumn("P.R. (Prev)", disabled=True),
-            "cr_reading": st.column_config.NumberColumn("C.R. (Current)", help="Enter latest meter reading"),
-            "units_consumed": st.column_config.NumberColumn("Units", disabled=True),
-            "elec_rate": st.column_config.NumberColumn("Rate (₹)", disabled=True, format="₹%d"),
-            "elec_charge": st.column_config.NumberColumn("Elec Chg (₹)", disabled=True, format="₹%d"),
-            "water_charge": st.column_config.NumberColumn("Water Chg (₹)", format="₹%d"),
-            "total_payable": st.column_config.NumberColumn("Total (₹)", disabled=True, format="₹%d"),
-            "remarks": st.column_config.TextColumn("Remarks / Notes")
-        },
-        hide_index=True,
-        width="stretch"
-    )
-    
-    if st.button("💾 Save Ledger Updates"):
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        for _, row in edited_df.iterrows():
-            cr_val = float(row['cr_reading']) if pd.notnull(row['cr_reading']) else None
-            mob_val = str(row['mobile_no']).strip() if pd.notnull(row['mobile_no']) else ""
-            prev_bal_val = float(row['previous_balance']) if pd.notnull(row['previous_balance']) else 0.0
-            water_val = float(row['water_charge']) if pd.notnull(row['water_charge']) else 0.0
-            remarks_val = str(row['remarks']) if pd.notnull(row['remarks']) else ""
-            
-            cursor.execute("""
-                UPDATE ledger 
-                SET cr_reading = ?, mobile_no = ?, previous_balance = ?, water_charge = ?, remarks = ?
-                WHERE id = ?
-            """, (cr_val, mob_val, prev_bal_val, water_val, remarks_val, int(row['id'])))
-        conn.commit()
-        conn.close()
-        st.success("Successfully saved all updates!")
-        st.rerun()
+    if ledger_df.empty:
+        st.warning("No tenant records found for this selection.")
+    else:
+        display_df = ledger_df[['id', 'house_name', 'tenant_name', 'mobile_no', 'category', 'base_rent', 'previous_balance', 'pr_reading', 'cr_reading', 'units_consumed', 'elec_rate', 'elec_charge', 'water_charge', 'total_payable', 'remarks']].copy()
+        
+        edited_df = st.data_editor(
+            display_df,
+            column_config={
+                "id": None,
+                "house_name": st.column_config.TextColumn("House / Property", disabled=True),
+                "tenant_name": st.column_config.TextColumn("Tenant Name", disabled=True),
+                "mobile_no": st.column_config.TextColumn("Mobile No", help="10-digit phone number"),
+                "category": st.column_config.TextColumn("Category", disabled=True),
+                "base_rent": st.column_config.NumberColumn("Base Rent (₹)", disabled=True, format="₹%d"),
+                "previous_balance": st.column_config.NumberColumn("Prev Arrears (₹)", help="Previous unpaid dues", format="₹%d"),
+                "pr_reading": st.column_config.NumberColumn("P.R. (Prev)", disabled=True),
+                "cr_reading": st.column_config.NumberColumn("C.R. (Current)", help="Enter latest meter reading"),
+                "units_consumed": st.column_config.NumberColumn("Units", disabled=True),
+                "elec_rate": st.column_config.NumberColumn("Rate (₹)", disabled=True, format="₹%d"),
+                "elec_charge": st.column_config.NumberColumn("Elec Chg (₹)", disabled=True, format="₹%d"),
+                "water_charge": st.column_config.NumberColumn("Water Chg (₹)", format="₹%d"),
+                "total_payable": st.column_config.NumberColumn("Total (₹)", disabled=True, format="₹%d"),
+                "remarks": st.column_config.TextColumn("Remarks / Notes")
+            },
+            hide_index=True,
+            width="stretch"
+        )
+        
+        if st.button("💾 Save Ledger Updates"):
+            conn = get_connection()
+            cursor = conn.cursor()
+            for _, row in edited_df.iterrows():
+                cr_val = float(row['cr_reading']) if pd.notnull(row['cr_reading']) else None
+                prev_bal_val = float(row['previous_balance']) if pd.notnull(row['previous_balance']) else 0.0
+                water_val = float(row['water_charge']) if pd.notnull(row['water_charge']) else 0.0
+                mob_val = str(row['mobile_no']).strip() if pd.notnull(row['mobile_no']) else ""
+                remarks_val = str(row['remarks']) if pd.notnull(row['remarks']) else ""
+                
+                if IS_POSTGRES:
+                    cursor.execute("""
+                        UPDATE ledger 
+                        SET cr_reading = %s, previous_balance = %s, water_charge = %s, mobile_no = %s, remarks = %s
+                        WHERE id = %s
+                    """, (cr_val, prev_bal_val, water_val, mob_val, remarks_val, int(row['id'])))
+                else:
+                    cursor.execute("""
+                        UPDATE ledger 
+                        SET cr_reading = ?, previous_balance = ?, water_charge = ?, mobile_no = ?, remarks = ?
+                        WHERE id = ?
+                    """, (cr_val, prev_bal_val, water_val, mob_val, remarks_val, int(row['id'])))
+                    
+            conn.commit()
+            conn.close()
+            st.success("Successfully saved all updates!")
+            st.rerun()
 
 with tab2:
     st.subheader("📱 Individual WhatsApp / Mobile Rent Receipt")
     
-    if len(ledger_df) == 0:
-        st.warning("No tenant records found for this filter.")
+    if ledger_df.empty:
+        st.warning("No tenants available in current view.")
     else:
         tenant_list = ledger_df['tenant_name'].tolist()
         selected_tenant = st.selectbox("Select Tenant for Receipt", tenant_list)
@@ -331,7 +412,7 @@ with tab2:
         with c2:
             st.write("📲 **Ready-to-Copy WhatsApp Message:**")
             
-            prev_bal_wa = (f"⏳ *Previous Balance (Bakaya):* ₹{t_data['previous_balance']:,.0f}\n" if t_data['previous_balance'] > 0 else "")
+            prev_bal_wa = f"⏳ *Previous Balance (Bakaya):* ₹{t_data['previous_balance']:,.0f}\n" if t_data['previous_balance'] > 0 else ""
             
             wa_text = f"""*RENT & UTILITY BILL ({selected_month})*
 ----------------------------------
@@ -353,7 +434,6 @@ _Please pay at your earliest convenience. Thank you!_"""
             st.code(wa_text, language="markdown")
             
             if t_data['mobile_no']:
-                import urllib.parse
                 clean_phone = "".join(filter(str.isdigit, str(t_data['mobile_no'])))
                 if len(clean_phone) == 10:
                     clean_phone = "91" + clean_phone
@@ -367,125 +447,210 @@ with tab3:
     col_h1, col_h2 = st.columns([1, 1])
     
     with col_h1:
-        st.write("🏠 **Add New Property / House**")
-        new_h_name = st.text_input("New Property / Building Name (e.g. House 2)")
-        if st.button("➕ Add House"):
-            if new_h_name.strip():
-                conn = get_db_connection()
+        st.markdown("#### 🏢 Add New House / Property")
+        with st.form("add_house_form"):
+            new_house_name = st.text_input("New House / Building Name (e.g. House 2)")
+            add_h_sub = st.form_submit_button("➕ Add House")
+            if add_h_sub and new_house_name.strip():
+                conn = get_connection()
                 cursor = conn.cursor()
                 try:
-                    cursor.execute("INSERT INTO houses (house_name) VALUES (?)", (new_h_name.strip(),))
+                    if IS_POSTGRES:
+                        cursor.execute("INSERT INTO properties (house_name) VALUES (%s)", (new_house_name.strip(),))
+                    else:
+                        cursor.execute("INSERT INTO properties (house_name) VALUES (?)", (new_house_name.strip(),))
                     conn.commit()
-                    st.success(f"Added {new_h_name} successfully!")
-                except sqlite3.IntegrityError:
-                    st.warning("House already exists!")
+                    st.success(f"Added Property: {new_house_name.strip()}")
+                except Exception:
+                    st.error("Property already exists or error occurred.")
                 conn.close()
                 st.rerun()
-                
-    st.markdown("---")
-    st.write("➕ **Add New Tenant to Current Month**")
-    
-    with st.form("add_tenant_form"):
-        col_a, col_b, col_c, col_c2 = st.columns(4)
-        new_h_select = col_a.selectbox("Select Property", houses_df['house_name'].tolist() if len(houses_df)>0 else ["Main House"])
-        new_name = col_b.text_input("Tenant Name")
-        new_mob = col_c.text_input("Mobile No")
-        new_cat = col_c2.selectbox("Category", ["Residential", "Shop", "Common Utility"])
-        
-        col_d, col_e, col_f, col_g = st.columns(4)
-        new_rent = col_d.number_input("Base Rent (₹)", min_value=0, value=3000)
-        new_prev_bal = col_e.number_input("Previous Balance (₹)", min_value=0, value=0)
-        new_pr = col_f.number_input("Initial P.R. Reading", min_value=0, value=0)
-        new_rate = col_g.number_input("Elec Rate (₹/unit)", min_value=1, value=9 if new_cat=="Shop" else 8)
-        
-        new_rem = st.text_input("Remarks", value=f"{new_cat} - Rate ₹{9 if new_cat=='Shop' else 8}/unit")
-        
-        submitted = st.form_submit_button("➕ Add Tenant")
-        if submitted and new_name.strip():
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            try:
-                cursor.execute("""
-                    INSERT INTO ledger (month_year, house_name, tenant_name, mobile_no, category, base_rent, previous_balance, pr_reading, cr_reading, elec_rate, water_charge, remarks)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 0, ?)
-                """, (selected_month, new_h_select, new_name.strip(), new_mob.strip(), new_cat, new_rent, new_prev_bal, new_pr, new_rate, new_rem))
-                conn.commit()
-                st.success(f"Added {new_name} to {selected_month}!")
-            except sqlite3.IntegrityError:
-                st.error("Tenant with this name already exists in this month!")
-            conn.close()
-            st.rerun()
+
+    with col_h2:
+        st.markdown("#### 👤 Add New Tenant Profile")
+        with st.form("add_tenant_form"):
+            t_house = st.selectbox("Assign Property", available_properties[1:] if len(available_properties)>1 else ["Main House"])
+            t_name = st.text_input("Tenant Name")
+            t_mob = st.text_input("Mobile No (Optional)")
+            t_cat = st.selectbox("Category", ["Residential", "Shop", "Common Utility"])
+            t_rent = st.number_input("Base Rent (₹)", min_value=0, value=3000)
+            t_prev = st.number_input("Previous Balance (₹)", min_value=0, value=0)
+            t_pr = st.number_input("Initial P.R. Reading", min_value=0, value=0)
+            t_rate = st.number_input("Elec Rate (₹/unit)", min_value=1, value=9 if t_cat=="Shop" else 8)
+            t_rem = st.text_input("Remarks", value=f"{t_cat} - Rate ₹{9 if t_cat=='Shop' else 8}/unit")
+            
+            add_t_sub = st.form_submit_button("➕ Add Tenant to Current Month")
+            if add_t_sub and t_name.strip():
+                conn = get_connection()
+                cursor = conn.cursor()
+                try:
+                    if IS_POSTGRES:
+                        cursor.execute("""
+                            INSERT INTO ledger (month_year, house_name, tenant_name, mobile_no, category, base_rent, previous_balance, pr_reading, cr_reading, elec_rate, water_charge, remarks)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, 0, %s)
+                        """, (selected_month, t_house, t_name.strip(), t_mob.strip(), t_cat, t_rent, t_prev, t_pr, t_rate, t_rem))
+                    else:
+                        cursor.execute("""
+                            INSERT INTO ledger (month_year, house_name, tenant_name, mobile_no, category, base_rent, previous_balance, pr_reading, cr_reading, elec_rate, water_charge, remarks)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 0, ?)
+                        """, (selected_month, t_house, t_name.strip(), t_mob.strip(), t_cat, t_rent, t_prev, t_pr, t_rate, t_rem))
+                    conn.commit()
+                    st.success(f"Added {t_name} to {selected_month}!")
+                except Exception as e:
+                    st.error(f"Tenant already exists or error: {e}")
+                conn.close()
+                st.rerun()
 
     st.markdown("---")
-    st.subheader("✏️ Edit or Delete Existing Tenant")
-    st.info("Select a tenant to modify their details or delete them.")
+    st.markdown("#### ✏️ Edit or Delete Existing Tenant Profile")
     
-    conn = get_db_connection()
-    all_tenants_df = pd.read_sql_query("SELECT DISTINCT tenant_name FROM ledger ORDER BY tenant_name ASC", conn)
-    conn.close()
-    
-    if len(all_tenants_df) > 0:
-        edit_tenant_name = st.selectbox("Select Tenant to Edit / Delete", all_tenants_df['tenant_name'].tolist())
+    all_tenants_df = query_to_df("SELECT DISTINCT tenant_name FROM ledger ORDER BY tenant_name ASC")
+    if not all_tenants_df.empty:
+        tenant_to_manage = st.selectbox("Select Tenant to Edit/Delete", all_tenants_df['tenant_name'].tolist())
         
-        # Load latest details of selected tenant
-        conn = get_db_connection()
-        t_info = pd.read_sql_query("SELECT * FROM ledger WHERE tenant_name = ? ORDER BY id DESC LIMIT 1", conn, params=(edit_tenant_name,)).iloc[0]
-        conn.close()
-        
-        st.write(f"Editing Details for: **{edit_tenant_name}**")
-        
-        with st.form("edit_tenant_form"):
-            e_col1, e_col2, e_col3 = st.columns(3)
-            updated_name = e_col1.text_input("Tenant Name", value=t_info['tenant_name'])
-            updated_house = e_col2.selectbox("Assigned Property/House", houses_df['house_name'].tolist() if len(houses_df)>0 else ["Main House"], index=0)
-            updated_mob = e_col3.text_input("Mobile No", value=t_info.get('mobile_no', ''))
+        t_curr_df = query_to_df("SELECT * FROM ledger WHERE tenant_name = ? ORDER BY id DESC LIMIT 1", params=(tenant_to_manage,))
+        if not t_curr_df.empty:
+            t_curr = t_curr_df.iloc[0]
             
-            e_col4, e_col5, e_col6 = st.columns(3)
-            updated_cat = e_col4.selectbox("Category", ["Residential", "Shop", "Common Utility"], index=["Residential", "Shop", "Common Utility"].index(t_info['category']) if t_info['category'] in ["Residential", "Shop", "Common Utility"] else 0)
-            updated_rent = e_col5.number_input("Base Rent (₹)", min_value=0, value=int(t_info['base_rent']))
-            updated_rate = e_col6.number_input("Elec Rate (₹/unit)", min_value=1, value=int(t_info['elec_rate']))
+            edit_col1, edit_col2 = st.columns([2, 1])
             
-            update_scope = st.radio("Apply Changes To:", ["Current Month Only (" + selected_month + ")", "All Ledger Months (Global Update)"])
+            with edit_col1:
+                with st.form("edit_tenant_form"):
+                    st.write(f"Editing Profile for: **{tenant_to_manage}**")
+                    e_house = st.selectbox("Property", available_properties[1:] if len(available_properties)>1 else ["Main House"], index=0)
+                    e_name = st.text_input("Tenant Name", value=t_curr['tenant_name'])
+                    e_mob = st.text_input("Mobile No", value=str(t_curr['mobile_no']) if pd.notnull(t_curr['mobile_no']) else "")
+                    e_cat = st.selectbox("Category", ["Residential", "Shop", "Common Utility"], index=0 if t_curr['category']=="Residential" else (1 if t_curr['category']=="Shop" else 2))
+                    e_rent = st.number_input("Base Rent (₹)", min_value=0, value=int(t_curr['base_rent']))
+                    e_rate = st.number_input("Elec Rate (₹/unit)", min_value=1, value=int(t_curr['elec_rate']))
+                    e_apply_all = st.checkbox("Apply Rent/House/Category updates to ALL Ledger Months?", value=True)
+                    
+                    save_edit_sub = st.form_submit_button("💾 Save Profile Updates")
+                    if save_edit_sub:
+                        conn = get_connection()
+                        cursor = conn.cursor()
+                        if e_apply_all:
+                            if IS_POSTGRES:
+                                cursor.execute("""
+                                    UPDATE ledger SET tenant_name=%s, house_name=%s, mobile_no=%s, category=%s, base_rent=%s, elec_rate=%s
+                                    WHERE tenant_name=%s
+                                """, (e_name.strip(), e_house, e_mob.strip(), e_cat, e_rent, e_rate, tenant_to_manage))
+                            else:
+                                cursor.execute("""
+                                    UPDATE ledger SET tenant_name=?, house_name=?, mobile_no=?, category=?, base_rent=?, elec_rate=?
+                                    WHERE tenant_name=?
+                                """, (e_name.strip(), e_house, e_mob.strip(), e_cat, e_rent, e_rate, tenant_to_manage))
+                        else:
+                            if IS_POSTGRES:
+                                cursor.execute("""
+                                    UPDATE ledger SET tenant_name=%s, house_name=%s, mobile_no=%s, category=%s, base_rent=%s, elec_rate=%s
+                                    WHERE tenant_name=%s AND month_year=%s
+                                """, (e_name.strip(), e_house, e_mob.strip(), e_cat, e_rent, e_rate, tenant_to_manage, selected_month))
+                            else:
+                                cursor.execute("""
+                                    UPDATE ledger SET tenant_name=?, house_name=?, mobile_no=?, category=?, base_rent=?, elec_rate=?
+                                    WHERE tenant_name=? AND month_year=?
+                                """, (e_name.strip(), e_house, e_mob.strip(), e_cat, e_rent, e_rate, tenant_to_manage, selected_month))
+                        conn.commit()
+                        conn.close()
+                        st.success(f"Updated profile for {e_name.strip()}!")
+                        st.rerun()
             
-            btn_save = st.form_submit_button("💾 Save Tenant Edits")
-            
-            if btn_save:
-                conn = get_db_connection()
-                cursor = conn.cursor()
-                if "Current Month" in update_scope:
-                    cursor.execute("""
-                        UPDATE ledger
-                        SET tenant_name = ?, house_name = ?, mobile_no = ?, category = ?, base_rent = ?, elec_rate = ?
-                        WHERE tenant_name = ? AND month_year = ?
-                    """, (updated_name.strip(), updated_house, updated_mob.strip(), updated_cat, updated_rent, updated_rate, edit_tenant_name, selected_month))
-                else:
-                    cursor.execute("""
-                        UPDATE ledger
-                        SET tenant_name = ?, house_name = ?, mobile_no = ?, category = ?, base_rent = ?, elec_rate = ?
-                        WHERE tenant_name = ?
-                    """, (updated_name.strip(), updated_house, updated_mob.strip(), updated_cat, updated_rent, updated_rate, edit_tenant_name))
-                conn.commit()
-                conn.close()
-                st.success(f"Successfully updated details for {updated_name}!")
-                st.rerun()
+            with edit_col2:
+                st.write("🗑️ **Delete Tenant Record**")
+                del_mode = st.radio("Delete Scope", ["Current Month Only", "All Months (Permanent)"])
+                confirm_del = st.checkbox(f"Confirm delete {tenant_to_manage}")
                 
-        # Delete Option
-        with st.expander("🗑️ Delete Tenant"):
-            st.warning(f"Are you sure you want to delete **{edit_tenant_name}**?")
-            delete_scope = st.radio("Delete Scope:", ["Remove from Current Month Only (" + selected_month + ")", "Permanently Delete from ALL Months"])
-            confirm_del = st.checkbox(f"Yes, I confirm deleting {edit_tenant_name}")
-            
-            if st.button("🚨 Delete Tenant Now"):
-                if confirm_del:
-                    conn = get_db_connection()
+                if st.button("🔴 Delete Tenant") and confirm_del:
+                    conn = get_connection()
                     cursor = conn.cursor()
-                    if "Current Month" in delete_scope:
-                        cursor.execute("DELETE FROM ledger WHERE tenant_name = ? AND month_year = ?", (edit_tenant_name, selected_month))
+                    if del_mode == "Current Month Only":
+                        if IS_POSTGRES:
+                            cursor.execute("DELETE FROM ledger WHERE tenant_name=%s AND month_year=%s", (tenant_to_manage, selected_month))
+                        else:
+                            cursor.execute("DELETE FROM ledger WHERE tenant_name=? AND month_year=?", (tenant_to_manage, selected_month))
                     else:
-                        cursor.execute("DELETE FROM ledger WHERE tenant_name = ?", (edit_tenant_name,))
+                        if IS_POSTGRES:
+                            cursor.execute("DELETE FROM ledger WHERE tenant_name=%s", (tenant_to_manage,))
+                        else:
+                            cursor.execute("DELETE FROM ledger WHERE tenant_name=?", (tenant_to_manage,))
                     conn.commit()
                     conn.close()
-                    st.success(f"Deleted {edit_tenant_name}!")
+                    st.success(f"Deleted {tenant_to_manage}!")
                     st.rerun()
-                else:
-                    st.error("Please tick the confirmation checkbox first.")
+
+with tab4:
+    st.subheader("💾 Backup & Restore Database")
+    st.info("Export your entire ledger data as JSON to keep a local backup, or upload a backup file to restore your data anytime!")
+    
+    col_b1, col_b2 = st.columns([1, 1])
+    
+    with col_b1:
+        st.markdown("#### 📥 Export Backup")
+        months_backup = query_to_df("SELECT * FROM months").to_dict(orient="records")
+        props_backup = query_to_df("SELECT * FROM properties").to_dict(orient="records")
+        ledger_backup = query_to_df("SELECT * FROM ledger").to_dict(orient="records")
+        
+        full_backup_data = {
+            "months": months_backup,
+            "properties": props_backup,
+            "ledger": ledger_backup,
+            "exported_at": str(datetime.datetime.now())
+        }
+        
+        json_backup_str = json.dumps(full_backup_data, indent=2)
+        st.download_button(
+            label="⬇️ Download Complete Database Backup (JSON)",
+            data=json_backup_str,
+            file_name=f"rent_ledger_backup_{datetime.date.today()}.json",
+            mime="application/json"
+        )
+        
+    with col_b2:
+        st.markdown("#### 📤 Restore Backup")
+        uploaded_backup = st.file_uploader("Upload JSON Backup File", type=["json"])
+        if uploaded_backup is not None:
+            if st.button("⚠️ Restore Data From Backup"):
+                try:
+                    backup_obj = json.load(uploaded_backup)
+                    conn = get_connection()
+                    cursor = conn.cursor()
+                    
+                    cursor.execute("DELETE FROM ledger;")
+                    cursor.execute("DELETE FROM properties;")
+                    cursor.execute("DELETE FROM months;")
+                    
+                    for m in backup_obj.get("months", []):
+                        if IS_POSTGRES:
+                            cursor.execute("INSERT INTO months (month_year) VALUES (%s) ON CONFLICT DO NOTHING;", (m['month_year'],))
+                        else:
+                            cursor.execute("INSERT OR IGNORE INTO months (month_year) VALUES (?);", (m['month_year'],))
+                            
+                    for p in backup_obj.get("properties", []):
+                        if IS_POSTGRES:
+                            cursor.execute("INSERT INTO properties (house_name) VALUES (%s) ON CONFLICT DO NOTHING;", (p['house_name'],))
+                        else:
+                            cursor.execute("INSERT OR IGNORE INTO properties (house_name) VALUES (?);", (p['house_name'],))
+                            
+                    for l in backup_obj.get("ledger", []):
+                        h_n = l.get('house_name', 'Main House')
+                        m_n = l.get('mobile_no', '')
+                        p_b = l.get('previous_balance', 0.0)
+                        if IS_POSTGRES:
+                            cursor.execute("""
+                                INSERT INTO ledger (month_year, house_name, tenant_name, mobile_no, category, base_rent, previous_balance, pr_reading, cr_reading, elec_rate, water_charge, remarks)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                ON CONFLICT DO NOTHING;
+                            """, (l['month_year'], h_n, l['tenant_name'], m_n, l['category'], l['base_rent'], p_b, l['pr_reading'], l.get('cr_reading'), l['elec_rate'], l['water_charge'], l.get('remarks', '')))
+                        else:
+                            cursor.execute("""
+                                INSERT OR IGNORE INTO ledger (month_year, house_name, tenant_name, mobile_no, category, base_rent, previous_balance, pr_reading, cr_reading, elec_rate, water_charge, remarks)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                            """, (l['month_year'], h_n, l['tenant_name'], m_n, l['category'], l['base_rent'], p_b, l['pr_reading'], l.get('cr_reading'), l['elec_rate'], l['water_charge'], l.get('remarks', '')))
+                            
+                    conn.commit()
+                    conn.close()
+                    st.success("Database restored successfully from backup!")
+                    st.rerun()
+                except Exception as ex:
+                    st.error(f"Failed to restore backup: {ex}")
