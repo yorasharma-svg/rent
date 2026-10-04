@@ -1,2 +1,2 @@
-# Rent Ledger App v11
-Deploy `app.py` to Streamlit Cloud.
+# Rent & Utility Management Web App (v12)
+Deploy on Streamlit Cloud or Replit with Supabase / SQLite support.

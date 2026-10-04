@@ -640,7 +640,7 @@ with tab4:
         "ledger": all_ledger.to_dict(orient="records") if not all_ledger.empty else []
     }
     
-    json_str = json.dumps(backup_data, indent=2)
+    json_str = json.dumps(backup_data, indent=2, default=str)
     st.download_button("⬇️ Download Database Backup (JSON)", data=json_str, file_name=f"rent_ledger_backup_{datetime.date.today()}.json", mime="application/json")
     
     st.markdown("---")
